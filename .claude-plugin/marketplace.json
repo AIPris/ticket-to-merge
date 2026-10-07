@@ -1,0 +1,19 @@
+{
+  "name": "ticket-to-merge",
+  "owner": {
+    "name": "AIPris",
+    "url": "https://github.com/AIPris"
+  },
+  "metadata": {
+    "description": "Ticket to Merge: autonomous GitHub issue solver for Claude Code.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ticket-to-merge",
+      "source": "./",
+      "description": "Autonomous GitHub issue solver for Claude Code (Windows): turns every open issue into a reviewed, CI-green, squash-merged pull request.",
+      "category": "productivity"
+    }
+  ]
+}
