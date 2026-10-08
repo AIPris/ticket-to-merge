@@ -90,9 +90,7 @@ In Claude Code:
 /plugin install ticket-to-merge@ticket-to-merge
 ```
 
-The skill is then available as `/ticket-to-merge:issue-loop`. If adding the marketplace fails with an access-rights
-error (the short form is cloned over SSH, so it needs an SSH key for GitHub), use the HTTPS URL instead:
-`/plugin marketplace add https://github.com/AIPris/ticket-to-merge.git`.
+The skill is then available as `/ticket-to-merge:issue-loop`.
 
 ### As a personal skill
 
