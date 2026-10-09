@@ -704,7 +704,7 @@ def wait_for_limit_reset(resets_at: float | None, label: str) -> None:
 
 
 def _run_claude_once(prompt: str, *, label: str, max_turns: int, read_only: bool) -> ClaudeRun:
-    LOG_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     prompt_file = LOG_DIR / f"{stamp}-{label}.prompt.txt"
     log_file = LOG_DIR / f"{stamp}-{label}.log.jsonl"
