@@ -37,6 +37,9 @@ Start it in the evening, and review the merged and parked pull requests in the m
   verified and reviewed again before it is pushed.
 - **Respects branch protection.** Merges with `gh pr merge --squash --match-head-commit`, never with `--admin`, and
   never while CI is red or uncertain.
+- **Commit messages that describe the change.** The worker writes the commit message: a short imperative subject
+  and a body that says why the change was needed and how it is tested. The supervisor uses it for the PR title and
+  the squash commit, and adds the PR number and `Closes #N` itself.
 - **Survives usage limits.** When a session hits the Claude 5-hour or weekly limit, the loop sleeps until the reset
   and re-runs that session.
 - **Never loses work.** On any failure it stops and keeps unfinished changes on a local
@@ -46,7 +49,8 @@ Start it in the evening, and review the merged and parked pull requests in the m
 
 ## How it works
 
-A Python supervisor (`run_issues.py`) does all git and GitHub work itself. Claude only edits code and reviews it.
+A Python supervisor (`run_issues.py`) does all git and GitHub work itself. Claude only edits code, writes the commit
+message and reviews the change.
 
 ```mermaid
 flowchart TD
@@ -154,7 +158,9 @@ because the supervisor refuses to start on a dirty working tree.
 |---|---|---|
 | `verify` | auto-detected | Commands the supervisor runs after every worker session. All must pass before anything is committed |
 | `protected_paths` | none | Path prefixes a change must not touch. If it does, the loop stops before pushing |
-| `model` | Claude Code default | Model for every session, for example `"opus"` |
+| `model` | Claude Code default | Default model for every session, for example `"opus"` |
+| `worker_model` | `model` | Model for the sessions that change code: the worker and the local repair, review fix and CI repair sessions |
+| `review_model` | `model` | Model for the review sessions |
 | `worker_max_turns` | `200` | Turn limit for the session that solves an issue |
 | `ci_repair_max_turns` | `100` | Turn limit for CI repair, local repair and review-fix sessions |
 | `ci_repair_attempts` | `3` | Repair sessions after red CI before the loop stops |

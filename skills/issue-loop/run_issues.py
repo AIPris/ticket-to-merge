@@ -33,10 +33,12 @@ Safety:
 
 Per-repo settings (optional) in `<repo>/.issue-loop.json` - commit it, the tree must stay clean:
   {"verify": ["npm run build", "npm test"], "protected_paths": ["vendor/"],
-   "model": "opus", "worker_max_turns": 200, "ci_repair_max_turns": 100,
+   "model": "opus", "worker_model": "sonnet", "review_model": "opus",
+   "worker_max_turns": 200, "ci_repair_max_turns": 100,
    "ci_repair_attempts": 3, "local_repair_attempts": 2,
    "review": true, "review_rounds": 2, "review_max_turns": 80}
 Without "verify" the commands are auto-detected (package.json build/test scripts, pytest).
+"worker_model" (sessions that change code) and "review_model" (review sessions) override "model".
 
 Usage:
     python run_issues.py --repo <path> --check         # preflight, shows next issue, changes nothing
@@ -53,6 +55,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from dataclasses import dataclass
@@ -83,7 +86,8 @@ PROTECTED_PATHS: tuple[str, ...] = ()
 REMOTE = "origin"
 BRANCH_PREFIX = "agent/issue-"
 
-CLAUDE_MODEL = None              # e.g. "opus"; None = Claude Code's configured default
+WORKER_MODEL = None              # e.g. "sonnet"; None = Claude Code's configured default
+REVIEW_MODEL = None              # e.g. "opus"
 WORKER_MAX_TURNS = 200
 CI_REPAIR_MAX_TURNS = 100
 CLAUDE_TIMEOUT_SEC = 2 * 60 * 60
@@ -138,7 +142,7 @@ def detect_verify_commands(repo: Path) -> list[list[str]]:
 
 def configure(repo_arg: str) -> None:
     """Resolve the repo root and apply defaults + optional <repo>/.issue-loop.json."""
-    global REPO_DIR, LOG_DIR, LOCK_FILE, STATUS_FILE, VERIFY_COMMANDS, PROTECTED_PATHS, CLAUDE_MODEL
+    global REPO_DIR, LOG_DIR, LOCK_FILE, STATUS_FILE, VERIFY_COMMANDS, PROTECTED_PATHS, WORKER_MODEL, REVIEW_MODEL
     global WORKER_MAX_TURNS, CI_REPAIR_MAX_TURNS, CI_REPAIR_ATTEMPTS, LOCAL_REPAIR_ATTEMPTS
     global REVIEW_ENABLED, REVIEW_ROUNDS, REVIEW_MAX_TURNS
     start = Path(repo_arg).resolve()
@@ -162,7 +166,8 @@ def configure(repo_arg: str) -> None:
     else:
         VERIFY_COMMANDS = [shlex.split(v, posix=False) if isinstance(v, str) else list(v) for v in verify]
     PROTECTED_PATHS = tuple(cfg.get("protected_paths", ()))
-    CLAUDE_MODEL = cfg.get("model", CLAUDE_MODEL)
+    WORKER_MODEL = cfg.get("worker_model", cfg.get("model", WORKER_MODEL))
+    REVIEW_MODEL = cfg.get("review_model", cfg.get("model", REVIEW_MODEL))
     WORKER_MAX_TURNS = cfg.get("worker_max_turns", WORKER_MAX_TURNS)
     CI_REPAIR_MAX_TURNS = cfg.get("ci_repair_max_turns", CI_REPAIR_MAX_TURNS)
     CI_REPAIR_ATTEMPTS = cfg.get("ci_repair_attempts", CI_REPAIR_ATTEMPTS)
@@ -172,6 +177,7 @@ def configure(repo_arg: str) -> None:
     REVIEW_MAX_TURNS = cfg.get("review_max_turns", REVIEW_MAX_TURNS)
     say(f"repository: {REPO_DIR}")
     say(f"verify commands: {verify_text()}   protected paths: {', '.join(PROTECTED_PATHS) or '(none)'}")
+    say(f"models: worker {WORKER_MODEL or 'Claude Code default'}, reviewer {REVIEW_MODEL or 'Claude Code default'}")
     say(f"code review: on, up to {REVIEW_ROUNDS} fix round(s), then park with label '{PARK_LABEL}'"
         if REVIEW_ENABLED else "code review: OFF")
     if not VERIFY_COMMANDS:
@@ -476,6 +482,24 @@ def format_issue(issue: dict) -> str:
 RESULT_DONE = re.compile(r"^\W*RESULT:\s*DONE\b", re.M)
 RESULT_BLOCKED = re.compile(r"^\W*RESULT:\s*BLOCKED\b:?\s*(.*)$", re.M)
 REVIEW_VERDICT = re.compile(r"^\W*REVIEW:\s*(APPROVE|CHANGES)\W*$", re.M)  # the whole line must be the verdict
+# The worker's commit message: a "Commit message:" line, then a ``` fenced block (an info string is tolerated).
+COMMIT_BLOCK = re.compile(r"^\W*commit message[^\w\n]*\n\s*```[^\n]*\n(.*?)\n\s*```", re.M | re.S | re.I)
+# "Fixes #12" in a commit on the default branch closes issue 12; only the supervisor may close issues.
+CLOSING_REF = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s*(?:[\w.-]+/[\w.-]+#|#|GH-|https?://\S+/issues/)\d+", re.I)
+COMMIT_SUBJECT_MAX = 72          # the prompt asks for 64, so that " (#PR)" usually still fits in 72
+
+
+def parse_commit_message(text: str) -> str | None:
+    """The last valid commit message block in a session's final message(s), as "subject\\n\\nbody"; None if none.
+    Invalid blocks (subject missing or too long, or a reference that would close an issue) are skipped."""
+    for block in reversed(COMMIT_BLOCK.findall(text.replace("\r\n", "\n"))):
+        subject, _, body = textwrap.dedent(block).strip().partition("\n")
+        subject, body = subject.strip(), body.strip()
+        if subject and len(subject) <= COMMIT_SUBJECT_MAX and not CLOSING_REF.search(block):
+            return f"{subject}\n\n{body}" if body else subject
+    return None
+
 
 def worker_rules() -> str:
     protected = (f"- Never modify anything under {', '.join(PROTECTED_PATHS)} (read-only).\n"
@@ -512,6 +536,24 @@ Workflow:
 4. Run the relevant tests plus lint/typecheck/build if the repo defines them. The supervisor will independently
    run: {verify_text()}. These must pass.
 5. Inspect your own `git diff` and untracked files, fix any problems, remove debris and temp files.
+6. Write the commit message for the whole change; the supervisor commits with it and uses it for the squash
+   merge. Put it in your final message, after the summary and before the RESULT line, like this example:
+
+Commit message:
+```
+Keep the cursor position when undoing a paste
+
+Undo restored the text but moved the cursor to the start of the
+document, because the selection was not part of the undo step. Store
+it with each step. Covered by a new test in editor.test.js.
+```
+
+- Subject: what the change does, in the imperative mood, at most 64 characters, no trailing period.
+- Body: why the change was needed and what it does, then how it is tested. Wrap lines at 72 characters.
+- No issue or PR numbers, no tags such as [P2], no trailers or sign-offs. The supervisor adds the PR number and
+  closes the issue itself.
+- If `git log --oneline -30` shows a prefix convention such as `feat:` or `ui:`, follow it. Ignore subjects that
+  start with `Fix #`; this supervisor wrote those.
 
 ===== ISSUE =====
 {format_issue(issue)}
@@ -646,6 +688,7 @@ sure they pass. In your final summary, list every blocking finding by its number
 @dataclass
 class ClaudeRun:
     result: str
+    commit_message: str | None = None  # see parse_commit_message()
 
 
 def _brief(tool_input: dict) -> str:
@@ -715,13 +758,15 @@ def _run_claude_once(prompt: str, *, label: str, max_turns: int, read_only: bool
         "--max-turns", str(max_turns), "--no-session-persistence",
         "--dangerously-skip-permissions",
     ]
-    if CLAUDE_MODEL:
-        cmd += ["--model", CLAUDE_MODEL]
+    model = REVIEW_MODEL if read_only else WORKER_MODEL
+    if model:
+        cmd += ["--model", model]
     cmd += ["--disallowedTools", *(REVIEWER_DISALLOWED_TOOLS if read_only else WORKER_DISALLOWED_TOOLS)]
 
     set_status(stage=f"Claude working ({label})")
-    say(f"starting Claude session '{label}' (max {max_turns} turns); log: {log_file}")
+    say(f"starting Claude session '{label}' ({model or 'default model'}, max {max_turns} turns); log: {log_file}")
     result_text, is_error, subtype = "", True, "no result event"
+    results: list[str] = []  # a finished background task can add a turn, and with it another result event
     limit_hit, resets_at = False, None
     with open(prompt_file, "rb") as stdin, open(log_file, "w", encoding="utf-8") as log:
         proc = subprocess.Popen(
@@ -752,6 +797,7 @@ def _run_claude_once(prompt: str, *, label: str, max_turns: int, read_only: bool
                         limit_hit, resets_at = True, info.get("resetsAt")
                 if event.get("type") == "result":
                     result_text = event.get("result") or ""
+                    results.append(result_text)
                     is_error = bool(event.get("is_error"))
                     subtype = event.get("subtype", "")
                     limit_hit = limit_hit or event.get("api_error_status") == 429
@@ -774,7 +820,7 @@ def _run_claude_once(prompt: str, *, label: str, max_turns: int, read_only: bool
     if not RESULT_DONE.search(result_text):
         raise SupervisorError(f"Claude finished without 'RESULT: DONE' (unsure -> stopping). See {log_file}")
     say(f"Claude session '{label}' finished: DONE")
-    return ClaudeRun(result_text)
+    return ClaudeRun(result_text, parse_commit_message("\n\n".join(results)))
 
 
 # ============================================================================
@@ -795,12 +841,13 @@ def run_verify() -> tuple[bool, str]:
 
 def work_until_verified(prompt: str, issue: dict, label: str, max_turns: int) -> ClaudeRun:
     """Run a worker, then the supervisor's own verification (with limited worker re-runs).
-    The result is the worker's summary followed by any local-fix summaries."""
-    summaries = [run_claude(prompt, label=label, max_turns=max_turns).result]
+    The result is the worker's summary followed by any local-fix summaries; the commit message is the worker's."""
+    work = run_claude(prompt, label=label, max_turns=max_turns)
+    summaries = [work.result]
     for attempt in range(LOCAL_REPAIR_ATTEMPTS + 1):
         ok, output = run_verify()
         if ok:
-            return ClaudeRun("\n\n".join(summaries))
+            return ClaudeRun("\n\n".join(summaries), work.commit_message)
         if attempt == LOCAL_REPAIR_ATTEMPTS:
             raise SupervisorError(f"Local verification still failing after {LOCAL_REPAIR_ATTEMPTS} repairs:\n{output}")
         say(f"local verification failed; repair attempt {attempt + 1}/{LOCAL_REPAIR_ATTEMPTS}")
@@ -817,6 +864,13 @@ def commit_all(message: str) -> bool:
         return False
     git("commit", "-m", message)
     return True
+
+
+def change_message(head: str = "HEAD") -> tuple[str, str]:
+    """(subject, body) of the branch's first commit, whose message describes the whole change."""
+    first = git("rev-list", "--reverse", f"{base_ref()}..{head}").splitlines()[0]
+    subject, _, body = git("log", "-1", "--format=%s%n%b", first).partition("\n")
+    return subject, body.strip()
 
 
 def check_protected_paths() -> None:
@@ -933,7 +987,7 @@ def ensure_pr(issue: dict, branch: str, summary: str) -> dict:
     body_file = LOG_DIR / f"pr-body-{n}.md"
     body_file.write_text(body, encoding="utf-8")
     gh("pr", "create", "--base", BASE_BRANCH, "--head", branch,
-       "--title", f"Fix #{n}: {issue['title']}", "--body-file", str(body_file))
+       "--title", change_message()[0], "--body-file", str(body_file))
     pr = find_open_pr(branch)
     if not pr:
         raise SupervisorError("PR was created but could not be found afterwards.")
@@ -1036,9 +1090,11 @@ def wait_for_checks(pr_number: int, sha: str, expect_checks: bool) -> tuple[str,
 def merge_pr(issue: dict, pr: dict, sha: str) -> None:
     n = issue["number"]
     set_status(stage=f"merging PR #{pr['number']}")
+    subject, body = change_message(sha)
+    body_file = LOG_DIR / f"merge-body-{n}.md"
+    body_file.write_text(f"{body}\n\nCloses #{n}" if body else f"Closes #{n}", encoding="utf-8")
     proc = run(["gh", "pr", "merge", str(pr["number"]), "--squash", "--match-head-commit", sha,
-                "--subject", f"Fix #{n}: {issue['title']} (#{pr['number']})", "--body", f"Closes #{n}"],
-               check=False)
+                "--subject", f"{subject} (#{pr['number']})", "--body-file", str(body_file)], check=False)
     if proc.returncode != 0:
         raise SupervisorError(
             "GitHub refused the merge (branch protection, conflicts, or head changed). "
@@ -1081,8 +1137,11 @@ def process_issue(number: int) -> bool:
 
     summary = ""
     if ahead_count(base_ref(), "HEAD") == 0:
-        summary = work_until_verified(issue_prompt(issue), issue, f"issue-{number}", WORKER_MAX_TURNS).result
-        if not commit_all(f"Fix #{number}: {issue['title']}"):
+        work = work_until_verified(issue_prompt(issue), issue, f"issue-{number}", WORKER_MAX_TURNS)
+        summary = work.result
+        if not work.commit_message:
+            say("WARNING: the worker wrote no valid commit message; using the issue title instead")
+        if not commit_all(work.commit_message or f"Fix #{number}: {issue['title']}"):
             raise SupervisorError("Claude reported DONE but produced no changes; nothing to commit.")
     else:
         say(f"resuming existing branch ({ahead_count(base_ref(), 'HEAD')} commit(s) ahead of {base_ref()})")

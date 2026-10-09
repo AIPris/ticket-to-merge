@@ -69,12 +69,14 @@ Optional `<repo>\.issue-loop.json` (commit it - the tree must stay clean):
 
 ```json
 { "verify": ["npm run build", "npm test"], "protected_paths": ["vendor/"], "model": "opus",
+  "worker_model": "sonnet", "review_model": "opus",
   "worker_max_turns": 200, "ci_repair_max_turns": 100, "ci_repair_attempts": 3, "local_repair_attempts": 2,
   "review": true, "review_rounds": 2, "review_max_turns": 80 }
 ```
 
-`"review": false` turns the review gate off. `review_rounds` is the number of fix + re-review rounds before
-an issue is parked.
+`model` applies to every session; `worker_model` (sessions that change code) and `review_model` (review
+sessions) override it. `"review": false` turns the review gate off. `review_rounds` is the number of fix +
+re-review rounds before an issue is parked.
 
 Without `verify`, commands are auto-detected (package.json `build`/`test` scripts, or pytest).
 Logs and lock files live in `%LOCALAPPDATA%\issue-loop\`.
