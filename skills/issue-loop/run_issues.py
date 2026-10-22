@@ -153,8 +153,8 @@ def configure(repo_arg: str) -> None:
     if top.returncode != 0:
         raise SupervisorError(f"{start} is not inside a git repository.")
     REPO_DIR = Path(top.stdout.strip()).resolve()
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR = STATE_DIR / "logs" / REPO_DIR.name
+    LOG_DIR.mkdir(parents=True, exist_ok=True)  # also creates STATE_DIR; every later log write relies on it
     LOCK_FILE = STATE_DIR / f"{REPO_DIR.name}.lock"
     STATUS_FILE = STATE_DIR / f"{REPO_DIR.name}.status.json"
 
@@ -747,7 +747,6 @@ def wait_for_limit_reset(resets_at: float | None, label: str) -> None:
 
 
 def _run_claude_once(prompt: str, *, label: str, max_turns: int, read_only: bool) -> ClaudeRun:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     prompt_file = LOG_DIR / f"{stamp}-{label}.prompt.txt"
     log_file = LOG_DIR / f"{stamp}-{label}.log.jsonl"
