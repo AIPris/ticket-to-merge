@@ -810,7 +810,7 @@ def _run_claude_once(prompt: str, *, label: str, max_turns: int, read_only: bool
 
     if (code != 0 or is_error) and limit_hit and not timed_out:
         raise UsageLimitReached(resets_at)
-    if code != 0 or is_error:
+    if code != 0 or is_error or timed_out:  # a session past its deadline is not trusted, whatever it printed
         why = "timed out" if timed_out else f"exit code {code}, result '{subtype}'"
         raise SupervisorError(f"Claude session '{label}' failed ({why}). See {log_file}\n{tail(result_text, 1500)}")
     blocked = RESULT_BLOCKED.search(result_text)
