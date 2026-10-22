@@ -169,6 +169,10 @@ because the supervisor refuses to start on a dirty working tree.
 | `review_rounds` | `2` | Fix and re-review rounds before an issue is parked |
 | `review_max_turns` | `80` | Turn limit for each review session |
 
+The repair and round counts (`ci_repair_attempts`, `local_repair_attempts`, `review_rounds`) must be whole numbers
+of 0 or more, and the `*_max_turns` limits whole numbers of 1 or more. Anything else stops the preflight. With
+`"ci_repair_attempts": 0`, CI is still checked once before the merge; it just gets no repair sessions.
+
 Without `verify`, the commands are auto-detected: `npm run build` and `npm test` when `package.json` defines those
 scripts, otherwise `python -m pytest -q` when the repository has a `pytest.ini`, `tox.ini`, `conftest.py` or
 `pyproject.toml`.
