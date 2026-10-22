@@ -140,6 +140,15 @@ def detect_verify_commands(repo: Path) -> list[list[str]]:
     return []
 
 
+def whole_number(cfg: dict, key: str, default: int, minimum: int) -> int:
+    """cfg[key] as a whole number >= minimum. A bad value stops the preflight: a negative CI budget would
+    otherwise skip the CI check entirely, and a bool or a string is a typo, not a number."""
+    value = cfg.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise SupervisorError(f"{CONFIG_FILE}: \"{key}\" must be a whole number >= {minimum}, not {value!r}.")
+    return value
+
+
 def configure(repo_arg: str) -> None:
     """Resolve the repo root and apply defaults + optional <repo>/.issue-loop.json."""
     global REPO_DIR, LOG_DIR, LOCK_FILE, STATUS_FILE, VERIFY_COMMANDS, PROTECTED_PATHS, WORKER_MODEL, REVIEW_MODEL
@@ -168,13 +177,13 @@ def configure(repo_arg: str) -> None:
     PROTECTED_PATHS = tuple(cfg.get("protected_paths", ()))
     WORKER_MODEL = cfg.get("worker_model", cfg.get("model", WORKER_MODEL))
     REVIEW_MODEL = cfg.get("review_model", cfg.get("model", REVIEW_MODEL))
-    WORKER_MAX_TURNS = cfg.get("worker_max_turns", WORKER_MAX_TURNS)
-    CI_REPAIR_MAX_TURNS = cfg.get("ci_repair_max_turns", CI_REPAIR_MAX_TURNS)
-    CI_REPAIR_ATTEMPTS = cfg.get("ci_repair_attempts", CI_REPAIR_ATTEMPTS)
-    LOCAL_REPAIR_ATTEMPTS = cfg.get("local_repair_attempts", LOCAL_REPAIR_ATTEMPTS)
+    WORKER_MAX_TURNS = whole_number(cfg, "worker_max_turns", WORKER_MAX_TURNS, 1)
+    CI_REPAIR_MAX_TURNS = whole_number(cfg, "ci_repair_max_turns", CI_REPAIR_MAX_TURNS, 1)
+    CI_REPAIR_ATTEMPTS = whole_number(cfg, "ci_repair_attempts", CI_REPAIR_ATTEMPTS, 0)
+    LOCAL_REPAIR_ATTEMPTS = whole_number(cfg, "local_repair_attempts", LOCAL_REPAIR_ATTEMPTS, 0)
     REVIEW_ENABLED = cfg.get("review", REVIEW_ENABLED)
-    REVIEW_ROUNDS = cfg.get("review_rounds", REVIEW_ROUNDS)
-    REVIEW_MAX_TURNS = cfg.get("review_max_turns", REVIEW_MAX_TURNS)
+    REVIEW_ROUNDS = whole_number(cfg, "review_rounds", REVIEW_ROUNDS, 0)
+    REVIEW_MAX_TURNS = whole_number(cfg, "review_max_turns", REVIEW_MAX_TURNS, 1)
     say(f"repository: {REPO_DIR}")
     say(f"verify commands: {verify_text()}   protected paths: {', '.join(PROTECTED_PATHS) or '(none)'}")
     say(f"models: worker {WORKER_MODEL or 'Claude Code default'}, reviewer {REVIEW_MODEL or 'Claude Code default'}")

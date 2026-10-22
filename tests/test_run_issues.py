@@ -43,8 +43,12 @@ class SupervisorTestCase(unittest.TestCase):
         repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         if config is not None:
-            (repo / run_issues.CONFIG_FILE).write_text(json.dumps(config), encoding="utf-8")
+            self.write_config(repo, config)
         return repo
+
+    @staticmethod
+    def write_config(repo: Path, config: dict) -> None:
+        (repo / run_issues.CONFIG_FILE).write_text(json.dumps(config), encoding="utf-8")
 
 
 class LogDirectoryTests(SupervisorTestCase):
@@ -152,6 +156,86 @@ class SessionTests(SupervisorTestCase):
         limit = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 123}})
         with self.assertRaisesRegex(run_issues.SupervisorError, "timed out"):
             self.run_session([limit + "\n", result_event("limit", is_error=True)], code=1, timer=FiresOnStartTimer)
+
+
+class ConfigValidationTests(SupervisorTestCase):
+    """Issue #4: counts come from a committed file, so a bad value must stop the preflight, not skip CI."""
+
+    COUNTS = {"ci_repair_attempts": 0, "local_repair_attempts": 0, "review_rounds": 0}
+    TURN_LIMITS = ("worker_max_turns", "ci_repair_max_turns", "review_max_turns")
+
+    def assert_rejected(self, repo, key, bad):
+        self.write_config(repo, {key: bad})
+        with self.subTest(key=key, value=bad), self.assertRaisesRegex(run_issues.SupervisorError, key):
+            run_issues.configure(str(repo))
+
+    def test_bad_counts_are_rejected_before_anything_runs(self):
+        repo = self.make_repo()
+        for key in self.COUNTS:
+            for bad in (-1, 2.5, "3", True, False, None):
+                self.assert_rejected(repo, key, bad)
+
+    def test_bad_turn_limits_are_rejected(self):
+        repo = self.make_repo()
+        for key in self.TURN_LIMITS:
+            for bad in (0, -5, 1.5, "10", True):
+                self.assert_rejected(repo, key, bad)
+
+    def test_zero_is_a_valid_count(self):
+        run_issues.configure(str(self.make_repo(self.COUNTS)))
+        self.assertEqual((run_issues.CI_REPAIR_ATTEMPTS, run_issues.LOCAL_REPAIR_ATTEMPTS, run_issues.REVIEW_ROUNDS),
+                         (0, 0, 0))
+
+    def test_valid_values_and_defaults_are_kept(self):
+        run_issues.configure(str(self.make_repo({"ci_repair_attempts": 5, "worker_max_turns": 7})))
+        self.assertEqual((run_issues.CI_REPAIR_ATTEMPTS, run_issues.WORKER_MAX_TURNS), (5, 7))
+        self.assertEqual((run_issues.LOCAL_REPAIR_ATTEMPTS, run_issues.REVIEW_ROUNDS), (2, 2))
+
+
+class CiBudgetTests(SupervisorTestCase):
+    """The repair budget only limits repairs: the first CI check always happens before a merge."""
+
+    def run_pipeline(self, attempts, statuses):
+        run_issues.CI_REPAIR_ATTEMPTS = attempts
+        self.patched = {}
+        for name in ("prepare_branch", "run_verify", "commit_all", "push_reviewed", "ensure_pr", "comment_review",
+                     "wait_for_checks", "work_until_verified", "merge_pr", "finish_issue", "notify", "ahead_count",
+                     "fetch_issue"):
+            patcher = mock.patch.object(run_issues, name)
+            self.patched[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+        self.patched["fetch_issue"].return_value = {"number": 9, "title": "t", "url": "https://example.test/9"}
+        self.patched["ahead_count"].return_value = 1  # a resumed branch: skips the first worker session
+        self.patched["run_verify"].return_value = (True, "")
+        self.patched["commit_all"].return_value = True
+        self.patched["push_reviewed"].return_value = ("sha", "")
+        self.patched["ensure_pr"].return_value = {"number": 4, "url": "https://example.test/pull/4"}
+        self.patched["wait_for_checks"].side_effect = statuses
+        run_issues.process_issue(9)
+
+    def test_a_zero_budget_still_checks_ci_once_and_refuses_to_merge_a_failure(self):
+        with self.assertRaises(run_issues.SupervisorError):
+            self.run_pipeline(0, [("fail", ["tests"])])
+        self.assertEqual(self.patched["wait_for_checks"].call_count, 1)
+        self.patched["work_until_verified"].assert_not_called()
+        self.patched["merge_pr"].assert_not_called()
+
+    def test_a_zero_budget_merges_after_green_ci(self):
+        self.run_pipeline(0, [("pass", [])])
+        self.assertEqual(self.patched["wait_for_checks"].call_count, 1)
+        self.patched["merge_pr"].assert_called_once()
+
+    def test_a_positive_budget_is_the_first_check_plus_that_many_repairs(self):
+        self.run_pipeline(2, [("fail", ["a"]), ("fail", ["a"]), ("pass", [])])
+        self.assertEqual(self.patched["wait_for_checks"].call_count, 3)
+        self.assertEqual(self.patched["work_until_verified"].call_count, 2)
+        self.patched["merge_pr"].assert_called_once()
+
+    def test_an_exhausted_budget_does_not_merge(self):
+        with self.assertRaises(run_issues.SupervisorError):
+            self.run_pipeline(1, [("fail", ["a"]), ("fail", ["a"])])
+        self.assertEqual(self.patched["work_until_verified"].call_count, 1)
+        self.patched["merge_pr"].assert_not_called()
 
 
 if __name__ == "__main__":
