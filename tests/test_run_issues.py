@@ -5,6 +5,7 @@ Run from the repository root:  python -m unittest discover -s tests
 Nothing here talks to GitHub, Claude or a remote: every external call is mocked, and the supervisor's state
 (logs, lock, status file) is redirected into a temporary directory.
 """
+import contextlib
 import importlib.util
 import json
 import subprocess
@@ -78,6 +79,79 @@ class LogDirectoryTests(SupervisorTestCase):
         body = (run_issues.LOG_DIR / "pr-body-3.md").read_text(encoding="utf-8")
         self.assertIn("Closes #3", body)
         self.assertIn("--body-file", gh.call_args.args)
+
+
+def result_event(text, is_error=False):
+    return json.dumps({"type": "result", "subtype": "success", "is_error": is_error, "result": text}) + "\n"
+
+
+class FiresOnStartTimer:
+    """Stands in for threading.Timer: the session deadline passes the moment the timer starts."""
+
+    def __init__(self, interval, callback):
+        self.callback = callback
+
+    def start(self):
+        self.callback()
+
+    def cancel(self):
+        pass
+
+
+class SessionTests(SupervisorTestCase):
+    """Issue #5: a session whose deadline passed must never be accepted. Also the neighbouring outcomes."""
+
+    ISSUE = {"number": 1, "title": "t", "url": "https://example.test/1", "body": "b"}
+
+    def setUp(self):
+        super().setUp()
+        run_issues.LOG_DIR.mkdir(parents=True)
+        run_issues.exe = lambda name: name
+
+    @contextlib.contextmanager
+    def fake_session(self, lines, *, code=0, timer=None):
+        """Replace the claude process: it prints `lines`, then exits with `code`."""
+        proc = mock.Mock(stdout=iter(lines), pid=4242)
+        proc.wait.return_value = code
+        with mock.patch.object(run_issues.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(run_issues, "kill_tree"), \
+                mock.patch.object(run_issues.threading, "Timer", timer or run_issues.threading.Timer):
+            yield
+
+    def run_session(self, lines, **kwargs):
+        with self.fake_session(lines, **kwargs):
+            return run_issues._run_claude_once("prompt", label="test", max_turns=5, read_only=False)
+
+    def test_a_successful_result_without_a_timeout_is_accepted(self):
+        run = self.run_session([result_event("Fixed.\nRESULT: DONE")])
+        self.assertIn("RESULT: DONE", run.result)
+
+    def test_a_successful_result_after_the_timeout_fired_is_rejected(self):
+        with self.assertRaisesRegex(run_issues.SupervisorError, "timed out"):
+            self.run_session([result_event("Fixed.\nRESULT: DONE")], timer=FiresOnStartTimer)
+
+    def test_a_reviewer_approval_after_the_timeout_fired_is_not_an_approval(self):
+        report = "## Blocking findings\nNone.\n\nREVIEW: APPROVE\nRESULT: DONE"
+        with self.fake_session([result_event(report)], timer=FiresOnStartTimer), \
+                mock.patch.object(run_issues, "head_sha", return_value="abc"), \
+                mock.patch.object(run_issues, "is_dirty", return_value=False):
+            verdict, _ = run_issues.run_review(self.ISSUE, "base", "base", None, "review1")
+        self.assertEqual(verdict, "FAILED")
+
+    def test_a_nonzero_exit_still_fails(self):
+        with self.assertRaisesRegex(run_issues.SupervisorError, "exit code 1"):
+            self.run_session([result_event("RESULT: DONE")], code=1)
+
+    def test_a_usage_limit_is_still_retried_later(self):
+        limit = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 123}})
+        with self.assertRaises(run_issues.UsageLimitReached) as caught:
+            self.run_session([limit + "\n", result_event("limit", is_error=True)], code=1)
+        self.assertEqual(caught.exception.resets_at, 123)
+
+    def test_a_timeout_is_not_mistaken_for_a_usage_limit(self):
+        limit = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 123}})
+        with self.assertRaisesRegex(run_issues.SupervisorError, "timed out"):
+            self.run_session([limit + "\n", result_event("limit", is_error=True)], code=1, timer=FiresOnStartTimer)
 
 
 if __name__ == "__main__":
