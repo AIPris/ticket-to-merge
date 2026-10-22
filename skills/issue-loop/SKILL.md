@@ -71,12 +71,14 @@ Optional `<repo>\.issue-loop.json` (commit it - the tree must stay clean):
 { "verify": ["npm run build", "npm test"], "protected_paths": ["vendor/"], "model": "opus",
   "worker_model": "sonnet", "review_model": "opus",
   "worker_max_turns": 200, "ci_repair_max_turns": 100, "ci_repair_attempts": 3, "local_repair_attempts": 2,
-  "review": true, "review_rounds": 2, "review_max_turns": 80 }
+  "review": true, "review_rounds": 2, "review_max_turns": 80, "allow_no_ci": false }
 ```
 
 `model` applies to every session; `worker_model` (sessions that change code) and `review_model` (review
 sessions) override it. `"review": false` turns the review gate off. `review_rounds` is the number of fix +
-re-review rounds before an issue is parked.
+re-review rounds before an issue is parked. Counts must be whole numbers (0 or more; `*_max_turns` 1 or more),
+otherwise the preflight fails. If a workflow runs on pull requests but GitHub reports no checks for the PR, the
+loop stops and leaves the PR open; `"allow_no_ci": true` merges in that case instead (e.g. path-filtered workflows).
 
 Without `verify`, commands are auto-detected (package.json `build`/`test` scripts, or pytest).
 Logs and lock files live in `%LOCALAPPDATA%\issue-loop\`.
