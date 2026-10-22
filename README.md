@@ -168,6 +168,7 @@ because the supervisor refuses to start on a dirty working tree.
 | `review` | `true` | `false` turns the code review gate off |
 | `review_rounds` | `2` | Fix and re-review rounds before an issue is parked |
 | `review_max_turns` | `80` | Turn limit for each review session |
+| `allow_no_ci` | `false` | Merge even when workflows that run on pull requests report no checks. Set it if they are filtered by path or branch. By default the loop stops instead |
 
 The repair and round counts (`ci_repair_attempts`, `local_repair_attempts`, `review_rounds`) must be whole numbers
 of 0 or more, and the `*_max_turns` limits whole numbers of 1 or more. Anything else stops the preflight. With
@@ -185,6 +186,7 @@ scripts, otherwise `python -m pytest -q` when the repository has a `pytest.ini`,
 | Local build or tests fail | Starts up to 2 repair sessions, then stops |
 | The reviewer requests changes | A fixer session fixes or rebuts each finding, then the reviewer looks again. After 2 rounds the issue is parked |
 | CI fails | Starts up to 3 repair sessions, each reviewed again, then stops with the PR left open |
+| A workflow runs on pull requests, but GitHub reports no checks for the PR within 3 minutes | Stops with the PR left open instead of merging unverified. If the workflows are filtered out for that change, merge it yourself or set `allow_no_ci` |
 | Branch protection blocks the merge | Stops and leaves the PR open. It never bypasses protection |
 | A Claude usage limit is hit | Sleeps until the reported reset time plus 2 minutes, then re-runs that session |
 | Any other API error (overloaded, 5xx) | Stops |

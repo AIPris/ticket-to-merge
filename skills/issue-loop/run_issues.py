@@ -36,9 +36,11 @@ Per-repo settings (optional) in `<repo>/.issue-loop.json` - commit it, the tree 
    "model": "opus", "worker_model": "sonnet", "review_model": "opus",
    "worker_max_turns": 200, "ci_repair_max_turns": 100,
    "ci_repair_attempts": 3, "local_repair_attempts": 2,
-   "review": true, "review_rounds": 2, "review_max_turns": 80}
+   "review": true, "review_rounds": 2, "review_max_turns": 80, "allow_no_ci": false}
 Without "verify" the commands are auto-detected (package.json build/test scripts, pytest).
 "worker_model" (sessions that change code) and "review_model" (review sessions) override "model".
+If a workflow runs on pull requests but GitHub reports no checks for the PR (a delay, or paths/branches filters),
+the loop stops and leaves the PR open; "allow_no_ci": true merges in that case instead.
 
 Usage:
     python run_issues.py --repo <path> --check         # preflight, shows next issue, changes nothing
@@ -104,7 +106,9 @@ REVIEW_ROUNDS = 2                # fix -> re-review rounds before an issue is pa
 REVIEW_MAX_TURNS = 80
 PARK_LABEL = "agent-needs-human" # issues whose review never approved; the loop skips them
 
-CHECKS_GRACE_SEC = 90            # how long to wait for checks to appear when workflows exist
+ALLOW_NO_CI = False              # merge although workflows that run on pull requests report no checks
+CHECKS_GRACE_EXPECTED_SEC = 180  # how long checks may take to appear when a workflow is known to run on the PR
+CHECKS_GRACE_SEC = 90            # ... when workflows exist but none is known to (or ALLOW_NO_CI)
 CHECKS_GRACE_NO_WORKFLOWS_SEC = 15
 CHECKS_TIMEOUT_SEC = 45 * 60
 POLL_SEC = 20
@@ -153,7 +157,7 @@ def configure(repo_arg: str) -> None:
     """Resolve the repo root and apply defaults + optional <repo>/.issue-loop.json."""
     global REPO_DIR, LOG_DIR, LOCK_FILE, STATUS_FILE, VERIFY_COMMANDS, PROTECTED_PATHS, WORKER_MODEL, REVIEW_MODEL
     global WORKER_MAX_TURNS, CI_REPAIR_MAX_TURNS, CI_REPAIR_ATTEMPTS, LOCAL_REPAIR_ATTEMPTS
-    global REVIEW_ENABLED, REVIEW_ROUNDS, REVIEW_MAX_TURNS
+    global REVIEW_ENABLED, REVIEW_ROUNDS, REVIEW_MAX_TURNS, ALLOW_NO_CI
     start = Path(repo_arg).resolve()
     if not start.is_dir():
         raise SupervisorError(f"Repository folder not found: {start}")
@@ -184,6 +188,9 @@ def configure(repo_arg: str) -> None:
     REVIEW_ENABLED = cfg.get("review", REVIEW_ENABLED)
     REVIEW_ROUNDS = whole_number(cfg, "review_rounds", REVIEW_ROUNDS, 0)
     REVIEW_MAX_TURNS = whole_number(cfg, "review_max_turns", REVIEW_MAX_TURNS, 1)
+    ALLOW_NO_CI = cfg.get("allow_no_ci", ALLOW_NO_CI)
+    if not isinstance(ALLOW_NO_CI, bool):  # "false" is truthy; never let a typo switch the CI gate off
+        raise SupervisorError(f"{CONFIG_FILE}: \"allow_no_ci\" must be true or false, not {ALLOW_NO_CI!r}.")
     say(f"repository: {REPO_DIR}")
     say(f"verify commands: {verify_text()}   protected paths: {', '.join(PROTECTED_PATHS) or '(none)'}")
     say(f"models: worker {WORKER_MODEL or 'Claude Code default'}, reviewer {REVIEW_MODEL or 'Claude Code default'}")
@@ -1061,12 +1068,29 @@ def classify_checks(rollup: list[dict]) -> tuple[list[str], list[str]]:
     return pending, failed
 
 
+# A line naming pull_request or pull_request_target outside a comment. The standard library has no YAML parser, so
+# any mention counts as a trigger; a false positive only makes the loop wait for checks, never merge without them.
+PR_TRIGGER = re.compile(r"^[^#\n]*\bpull_request(?:_target)?\b", re.M)
+
+
+def pr_checks_expected() -> bool:
+    """True if a workflow in the repository runs on pull requests, so GitHub should report checks for the PR."""
+    folder = REPO_DIR / ".github" / "workflows"
+    return any(PR_TRIGGER.search(path.read_text(encoding="utf-8", errors="replace"))
+               for pattern in ("*.yml", "*.yaml") for path in folder.glob(pattern))
+
+
 def wait_for_checks(pr_number: int, sha: str, expect_checks: bool) -> tuple[str, list[str]]:
-    """Return ('pass'|'none'|'fail', failures). Raises on timeout / uncertainty."""
+    """Return ('pass'|'none'|'fail', failures). Raises on timeout / uncertainty. 'none' only means that no workflow
+    is known to run on this PR (or ALLOW_NO_CI): checks that are expected but not reported are never 'none'."""
     set_status(stage=f"waiting for CI on PR #{pr_number}")
     time.sleep(POST_PUSH_SETTLE_SEC)
     has_workflows = (REPO_DIR / ".github" / "workflows").is_dir()
-    grace = 180 if expect_checks else (CHECKS_GRACE_SEC if has_workflows else CHECKS_GRACE_NO_WORKFLOWS_SEC)
+    must_have_checks = not ALLOW_NO_CI and pr_checks_expected()
+    if expect_checks or must_have_checks:
+        grace = CHECKS_GRACE_EXPECTED_SEC
+    else:
+        grace = CHECKS_GRACE_SEC if has_workflows else CHECKS_GRACE_NO_WORKFLOWS_SEC
     start = time.time()
     stable_polls = 0
     while time.time() - start < CHECKS_TIMEOUT_SEC:
@@ -1080,6 +1104,12 @@ def wait_for_checks(pr_number: int, sha: str, expect_checks: bool) -> tuple[str,
             if time.time() - start >= grace:
                 if expect_checks:
                     raise SupervisorError("Checks existed before but none are reported now; stopping to be safe.")
+                if must_have_checks:
+                    raise SupervisorError(
+                        f"Workflows that run on pull requests exist, but GitHub reported no checks for PR #{pr_number} "
+                        f"within {grace}s; stopping instead of merging unverified. If they are filtered out for this "
+                        f"change (paths, branches), merge the PR yourself or set \"allow_no_ci\": true in {CONFIG_FILE}."
+                    )
                 return "none", []
             say("no checks reported yet...")
         else:

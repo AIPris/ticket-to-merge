@@ -8,9 +8,11 @@ Nothing here talks to GitHub, Claude or a remote: every external call is mocked,
 import contextlib
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -181,6 +183,21 @@ class ConfigValidationTests(SupervisorTestCase):
             for bad in (0, -5, 1.5, "10", True):
                 self.assert_rejected(repo, key, bad)
 
+    def test_allow_no_ci_defaults_to_off_and_can_be_switched_on(self):
+        repo = self.make_repo()
+        run_issues.configure(str(repo))
+        self.assertIs(run_issues.ALLOW_NO_CI, False)
+        self.write_config(repo, {"allow_no_ci": True})
+        run_issues.configure(str(repo))
+        self.assertIs(run_issues.ALLOW_NO_CI, True)
+
+    def test_allow_no_ci_must_be_a_real_boolean(self):
+        repo = self.make_repo()
+        for bad in ("false", "yes", 1, 0, None):
+            self.write_config(repo, {"allow_no_ci": bad})
+            with self.subTest(value=bad), self.assertRaisesRegex(run_issues.SupervisorError, "allow_no_ci"):
+                run_issues.configure(str(repo))
+
     def test_zero_is_a_valid_count(self):
         run_issues.configure(str(self.make_repo(self.COUNTS)))
         self.assertEqual((run_issues.CI_REPAIR_ATTEMPTS, run_issues.LOCAL_REPAIR_ATTEMPTS, run_issues.REVIEW_ROUNDS),
@@ -236,6 +253,106 @@ class CiBudgetTests(SupervisorTestCase):
             self.run_pipeline(1, [("fail", ["a"]), ("fail", ["a"])])
         self.assertEqual(self.patched["work_until_verified"].call_count, 1)
         self.patched["merge_pr"].assert_not_called()
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+PASSING = [{"name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+FAILING = [{"name": "tests", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://example.test/run"}]
+
+
+class CheckRegistrationTests(SupervisorTestCase):
+    """Issue #3: an empty check list is only "no CI" when no workflow is known to run on pull requests."""
+
+    PR_WORKFLOW = "name: CI\non: pull_request\njobs: {}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.workflows = self.repo / ".github" / "workflows"
+        run_issues.REPO_DIR = self.repo
+        run_issues.ALLOW_NO_CI = False
+        self.clock = FakeClock()
+        self.checks_appear_at, self.checks = float("inf"), PASSING
+        for patcher in (
+            mock.patch.object(run_issues, "time", types.SimpleNamespace(time=self.clock.time, sleep=self.clock.sleep)),
+            mock.patch.object(run_issues, "gh_json", side_effect=self.pr_view),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def pr_view(self, *args, **kwargs):
+        rollup = self.checks if self.clock.now >= self.checks_appear_at else []
+        return {"state": "OPEN", "headRefOid": "sha", "statusCheckRollup": rollup}
+
+    def add_workflow(self, text, name="ci.yml"):
+        self.workflows.mkdir(parents=True, exist_ok=True)
+        (self.workflows / name).write_text(text, encoding="utf-8")
+
+    def wait(self, expect_checks=False):
+        return run_issues.wait_for_checks(4, "sha", expect_checks)
+
+    def test_a_pull_request_workflow_with_no_reported_checks_stops_instead_of_merging(self):
+        self.add_workflow(self.PR_WORKFLOW)
+        with self.assertRaisesRegex(run_issues.SupervisorError, "no checks"):
+            self.wait()
+
+    def test_every_pull_request_trigger_form_counts(self):
+        forms = {
+            "ci.yml": "on: pull_request\n",
+            "ci.yaml": "on: pull_request\n",
+            "list.yml": "on: [push, pull_request]\n",
+            "target.yml": "on:\n  pull_request_target:\n    branches: [main]\n",
+            "filtered.yml": "on:\n  pull_request:\n    paths: ['src/**']\n",
+        }
+        for name, text in forms.items():
+            with self.subTest(workflow=name):
+                shutil.rmtree(self.workflows, ignore_errors=True)
+                self.clock.now = 0
+                self.add_workflow(text, name)
+                with self.assertRaisesRegex(run_issues.SupervisorError, "no checks"):
+                    self.wait()
+
+    def test_checks_that_register_late_are_still_waited_for(self):
+        self.add_workflow(self.PR_WORKFLOW)
+        self.checks_appear_at = 130  # well past the 90 s + settle time after which "none" used to be returned
+        self.assertEqual(self.wait(), ("pass", []))
+
+    def test_a_late_failure_is_reported_as_a_failure(self):
+        self.add_workflow(self.PR_WORKFLOW)
+        self.checks_appear_at, self.checks = 130, FAILING
+        status, failures = self.wait()
+        self.assertEqual(status, "fail")
+        self.assertIn("tests (FAILURE)", failures[0])
+
+    def test_workflows_that_never_run_on_pull_requests_mean_no_checks(self):
+        self.add_workflow("name: Deploy\non:\n  push:\n    branches: [main]\n  schedule:\n    - cron: '0 3 * * *'\n")
+        self.assertEqual(self.wait(), ("none", []))
+
+    def test_a_comment_mentioning_pull_request_is_not_a_trigger(self):
+        self.add_workflow("# not run on pull_request, only on push\non: push\n")
+        self.assertEqual(self.wait(), ("none", []))
+
+    def test_a_repository_without_workflows_has_no_checks(self):
+        self.assertEqual(self.wait(), ("none", []))
+
+    def test_allow_no_ci_restores_the_old_behaviour_for_filtered_workflows(self):
+        self.add_workflow(self.PR_WORKFLOW)
+        run_issues.ALLOW_NO_CI = True
+        self.assertEqual(self.wait(), ("none", []))
+
+    def test_checks_that_vanish_after_being_seen_still_stop(self):
+        with self.assertRaisesRegex(run_issues.SupervisorError, "Checks existed before"):
+            self.wait(expect_checks=True)
 
 
 if __name__ == "__main__":
